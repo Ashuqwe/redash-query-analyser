@@ -1,0 +1,6 @@
+# Ignore the configuration file containing secret API keys
+config.json
+
+# Ignore Python cache files
+__pycache__/
+*.pyc
