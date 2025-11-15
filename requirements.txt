@@ -4,3 +4,7 @@ requests
 openpyxl
 xlsxwriter
 groq
+matplotlib
+numpy
+seaborn
+plotly

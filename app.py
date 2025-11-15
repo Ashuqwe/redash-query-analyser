@@ -8,6 +8,12 @@ from datetime import datetime
 import json
 import os
 from groq import Groq
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.express as px
+
+
 
 CONFIG_FILE = "config.json"
 
@@ -138,7 +144,7 @@ def get_query_results(redash_url: str, query_id: int, api_key: str, parameters: 
         st.error(f"An unexpected error occurred: {e}")
         return pd.DataFrame()
 
-def get_llm_analysis_code(client: Groq, question: str, df: pd.DataFrame) -> str:
+def get_llm_analysis_code(client: Groq, chat_history: list, df: pd.DataFrame) -> str:
     """
     Uses an LLM to convert a natural language question into executable Python code.
     """
@@ -146,29 +152,40 @@ def get_llm_analysis_code(client: Groq, question: str, df: pd.DataFrame) -> str:
     df_head = df.head().to_string()
     df_info = df.dtypes.to_string()
 
-    prompt = f"""
-    You are an expert Python data analyst. Your task is to generate Python code to answer a user's question based on a pandas DataFrame.
-
-    **Instructions:**
-    1.  The DataFrame is available in a variable named `df`.
-    2.  The user's question is: "{question}"
-    3.  The first 5 rows of the DataFrame (`df.head()`) are:
-        ```
-        {df_head}
-        ```
-    4.  The column data types (`df.dtypes`) are:
-        ```
-        {df_info}
-        ```
-    5.  Your code should produce a result that can be displayed. This could be a print statement, a DataFrame, a Series, or a Streamlit chart.
-    6.  For plotting, **you must use Streamlit's charting functions**. For example: `st.bar_chart(data)`, `st.line_chart(data)`, `st.pyplot(fig)`. Do NOT use `plt.show()`.
-    7.  Wrap your final Python code in a single markdown code block (e.g., ```python ... ```). Do not include any explanations outside of the code block.
-    8.  If the question is unclear or cannot be answered with the given data, generate code that prints a clarification question, like `print("Could you please clarify what you mean by 'best performing'?")`.
-    """
+    prompt_data = {
+        "role": "Expert Python Data Analyst",
+        "task": "Generate Python code to answer a user's question based on a pandas DataFrame.",
+        "context": {
+            "dataframe_variable": "df",
+            "available_libraries": ["pandas as pd", "numpy as np", "matplotlib.pyplot as plt", "seaborn as sns", "plotly.express as px"],
+            "chat_history": chat_history,
+            "dataframe_head": df_head,
+            "dataframe_info": df_info
+        },
+        "instructions": [
+            "CRITICAL: To avoid errors, `st.dataframe` and `st.plotly_chart` MUST have a unique `key` argument. You MUST generate this key using the `key_counter` variable provided (e.g., `key=f'element_{next(key_counter)}'`). Do NOT use hardcoded string keys like `key='my_chart'`. The `st.pyplot` function does NOT accept a key. Static elements like `st.markdown` or `st.error` also do not need a key.",
+            "Your primary output should be a descriptive, multi-sentence textual answer written with `st.markdown()`. Only generate a chart (`st.pyplot`, `st.plotly_chart`) or a table (`st.dataframe`) if the user explicitly asks for one (e.g., 'show me a table', 'plot a bar chart of...').",
+            "When the user asks about a column, you MUST try to infer the correct column name. First, check for a case-insensitive match in `df.columns`. If no match is found, check if any column name contains the user's term as a substring. Use your best judgment to select the most likely column. Only if you are very unsure after these checks should you ask for clarification using `st.markdown()`.",
+            "Before performing mathematical operations, you MUST ensure the column is a numeric type. If it is an object/string type, you must first clean it and convert it to a numeric type using `pd.to_numeric(df['column'], errors='coerce')`.",
+            "When plotting aggregated data (e.g., from `value_counts()` or `groupby()`), you must prepare it for plotting. If the data to be plotted is in the index, you MUST call `.reset_index()` to turn it into a column. If `.reset_index()` causes a `ValueError` because the column already exists, you should instead drop the index by calling `data.index.name = None`.",
+            "For plotting, you must use Streamlit's charting functions. When using `matplotlib` or `seaborn`, you must create a figure and pass it to `st.pyplot()`. Example: `fig, ax = plt.subplots(); sns.histplot(df['column'], ax=ax); st.pyplot(fig)`. Do NOT use `plt.show()`. For `plotly`, use `st.plotly_chart(fig)`.",
+            "Prefer using `seaborn` or `plotly.express` for creating plots as they are more visually appealing.",
+            "CRITICAL: Your code MUST NOT perform any file I/O operations (e.g., reading from or writing to files like `data.csv`). All operations must be performed on the in-memory `df` DataFrame.",
+            "If the question is unclear or cannot be answered with the given data, use `st.markdown()` to ask a clarification question."
+        ],
+        "output_format": {
+            "format": "A single Python code block in markdown.",
+            "example": "```python\n# your python code here\n```",
+            "notes": "Do not include any explanations or text outside of the markdown code block."
+        }
+    }
+    
+    prompt = json.dumps(prompt_data, indent=2)
 
     chat_completion = client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-20b",
+        # model="llama3-8b-8192",
     )
     response_content = chat_completion.choices[0].message.content
     # Extract code from the markdown block
@@ -178,9 +195,6 @@ def get_llm_analysis_code(client: Groq, question: str, df: pd.DataFrame) -> str:
 # --- Streamlit App UI ---
 
 st.set_page_config(page_title="Redash Query Analyser", layout="wide")
-
-st.title("📊 Redash Query Analyser")
-st.write("Run Redash queries, analyze the results with pandas, and download them as Excel.")
 
 # --- Session State for Multi-Tab ---
 if 'tabs' not in st.session_state:
@@ -192,11 +206,18 @@ if 'tabs' not in st.session_state:
             "query_id_str": "",
             "params": [],
             "df": pd.DataFrame(),
-            "title": "Query 1"
+            "title": "Query 1",
+            "chat_history": []
         }
     ]
+if 'active_tab_index' not in st.session_state:
+    st.session_state.active_tab_index = 0
 
 with st.sidebar:
+    st.title("📊 Redash Query Analyser")
+    st.write("Configure queries on the left, see results on the right.")
+    st.divider()
+
     st.header("Connection Details")
     # As requested, hardcode the base URL and only ask for the query number.
     REDASH_BASE_URL = "https://common-redash.mmt.live"
@@ -216,100 +237,108 @@ with st.sidebar:
             "query_id_str": "",
             "params": [],
             "df": pd.DataFrame(),
-            "title": f"Query {len(st.session_state.tabs) + 1}"
+            "title": f"Query {len(st.session_state.tabs) + 1}",
+            "chat_history": []
         })
         st.session_state.next_tab_id += 1
         # To make the new tab active, we would ideally set it here, but Streamlit's st.tabs
         # doesn't support programmatic switching. The user will see the new tab appear.
+        # We will switch to it manually by setting the active index.
+        st.session_state.active_tab_index = len(st.session_state.tabs) - 1
+        st.rerun()
+
+    st.divider()
+    st.header("Analysis Tabs")
+
+    # Use st.radio as a tab selector in the sidebar
+    tab_titles = [tab["title"] for tab in st.session_state.tabs]
+    # The index of the selected radio button will determine the active tab
+    selected_title = st.radio("Select an analysis to view/edit:", tab_titles, index=st.session_state.active_tab_index, key="tab_selector")
+    st.session_state.active_tab_index = tab_titles.index(selected_title)
 
 def render_tab_content(tab_state):
     """Renders the UI and logic for a single analysis tab."""
     
-    # --- Close Tab Button ---
-    # Place it in columns to have it on the right side.
-    if len(st.session_state.tabs) > 1:
-        # This is the closest we can get to a browser-like tab closing experience with st.tabs
-        _, col2 = st.columns([0.9, 0.1])
-        with col2:
-            if st.button("❌", key=f"close_tab_{tab_state['id']}", help="Close this analysis tab", use_container_width=True):
-                st.session_state.tabs.remove(tab_state)
-                # Re-number the titles of the remaining tabs
-                for i, tab in enumerate(st.session_state.tabs):
-                    tab["title"] = f"Query {i + 1}" if "(" not in tab["title"] else f"Query {i + 1} ({tab['title'].split('(')[1]}"
-                st.rerun()
+    # --- All input controls are now in the sidebar ---
+    with st.sidebar:
+        with st.expander(f"Controls for {tab_state['title']}", expanded=True):
+            # --- Close Tab Button ---
+            if len(st.session_state.tabs) > 1:
+                if st.button("❌ Close this Analysis", key=f"close_tab_{tab_state['id']}", help="Close this analysis tab", use_container_width=True):
+                    st.session_state.tabs.remove(tab_state)
+                    # Re-number the titles and reset active tab index
+                    for i, tab in enumerate(st.session_state.tabs):
+                        tab["title"] = f"Query {i + 1}" if "(" not in tab["title"] else f"Query {i + 1} ({tab['title'].split('(')[1]}"
+                    st.session_state.active_tab_index = 0
+                    st.rerun()
 
-    tab_state["query_id_str"] = st.text_input(
-        "Redash Query Number", 
-        value=tab_state["query_id_str"], 
-        placeholder="e.g., 71328",
-        key=f"query_id_{tab_state['id']}"
-    )
+            tab_state["query_id_str"] = st.text_input(
+                "Redash Query Number", 
+                value=tab_state["query_id_str"], 
+                placeholder="e.g., 71328",
+                key=f"query_id_{tab_state['id']}"
+            )
 
-    query_id = int(tab_state["query_id_str"]) if tab_state["query_id_str"].isdigit() else None
+            query_id = int(tab_state["query_id_str"]) if tab_state["query_id_str"].isdigit() else None
 
-    if query_id and api_key:
-        if st.button("Load Query Parameters", use_container_width=True, key=f"load_params_{tab_state['id']}"):
-            with st.spinner("Loading query parameters..."):
-                tab_state["params"] = get_query_details(REDASH_BASE_URL, query_id, api_key)
-                if not tab_state["params"]:
-                    st.info("This query has no parameters.")
-    elif tab_state["query_id_str"]:
-        st.warning("Please enter a valid query number.")
-    
-    param_values = {}
-    if tab_state["params"]:
-        st.subheader("Query Parameters")
-        for param in tab_state["params"]:
-            param_name = param['name']
-            param_title = param.get('title', param_name)
-            param_type = param.get('type', 'text')
-            default_value = param.get('value')
+            if query_id and api_key:
+                if st.button("Load Query Parameters", use_container_width=True, key=f"load_params_{tab_state['id']}"):
+                    with st.spinner("Loading query parameters..."):
+                        tab_state["params"] = get_query_details(REDASH_BASE_URL, query_id, api_key)
+                        if not tab_state["params"]:
+                            st.info("This query has no parameters.")
+            elif tab_state["query_id_str"]:
+                st.warning("Please enter a valid query number.")
             
-            # The Redash API expects date-range parameters to be split into two
-            # separate parameters with .start and .end suffixes.
-            if param_type == 'date-range':
-                st.write(f"**{param_title}**") # Sub-header for the date range
-                start_key = f"{param_name}.start"
-                end_key = f"{param_name}.end"
-                
-                param_values[start_key] = st.text_input(
-                    label="Start Date",
-                    value=datetime.today().strftime('%Y-%m-%d'), # Default to today
-                    key=f"param_{start_key}_{tab_state['id']}"
-                )
-                param_values[end_key] = st.text_input(
-                    label="End Date",
-                    value=datetime.today().strftime('%Y-%m-%d'), # Default to today
-                    key=f"param_{end_key}_{tab_state['id']}"
-                )
-            else:
-                # For all other parameter types, use a standard text input.
-                param_values[param_name] = st.text_input(
-                    label=f"{param_title} (Type: {param_type})",
-                    value=str(default_value) if default_value is not None else "",
-                    key=f"param_{param_name}_{tab_state['id']}"
-                )
+            param_values = {}
+            if tab_state["params"]:
+                st.write("---")
+                st.subheader("Query Parameters")
+                for param in tab_state["params"]:
+                    param_name = param['name']
+                    param_title = param.get('title', param_name)
+                    param_type = param.get('type', 'text')
+                    default_value = param.get('value')
+                    
+                    if param_type == 'date-range':
+                        st.write(f"**{param_title}**")
+                        start_key = f"{param_name}.start"
+                        end_key = f"{param_name}.end"
+                        
+                        param_values[start_key] = st.text_input(
+                            label="Start Date",
+                            value=datetime.today().strftime('%Y-%m-%d'),
+                            key=f"param_{start_key}_{tab_state['id']}"
+                        )
+                        param_values[end_key] = st.text_input(
+                            label="End Date",
+                            value=datetime.today().strftime('%Y-%m-%d'),
+                            key=f"param_{end_key}_{tab_state['id']}"
+                        )
+                    else:
+                        param_values[param_name] = st.text_input(
+                            label=f"{param_title} (Type: {param_type})",
+                            value=str(default_value) if default_value is not None else "",
+                            key=f"param_{param_name}_{tab_state['id']}"
+                        )
 
-    if st.button("Fetch Query Results", use_container_width=True, key=f"fetch_results_{tab_state['id']}"):
-        if not tab_state["query_id_str"] or not api_key:
-            st.warning("Please provide both the Query Number and API Key.")
-        else:
-            if query_id:
-                # Save the API key if the user requested it
-                if save_keys:
-                    save_config(api_key, groq_api_key)
-                    st.toast("API Keys saved!", icon="🔑")
+            if st.button("Fetch Query Results", use_container_width=True, key=f"fetch_results_{tab_state['id']}"):
+                if not tab_state["query_id_str"] or not api_key:
+                    st.warning("Please provide both the Query Number and API Key.")
+                else:
+                    if query_id:
+                        if save_keys:
+                            save_config(api_key, groq_api_key)
+                            st.toast("API Keys saved!", icon="🔑")
 
-                redash_url = f"{REDASH_BASE_URL}/queries/{query_id}"
-                with st.spinner(f"Fetching results for Query ID: {query_id}..."):
-                    tab_state["df"] = get_query_results(redash_url, query_id, api_key, param_values)
-                    # Update tab title with query number
-                    current_index = st.session_state.tabs.index(tab_state)
-                    # Keep the sequential numbering but add the query ID for clarity
-                    tab_state["title"] = f"Query {current_index + 1} ({query_id})"
-                    st.rerun() # Rerun to update the tab title in the UI
-            else:
-                st.error("Invalid Query Number. Please enter a valid number.")
+                        redash_url = f"{REDASH_BASE_URL}/queries/{query_id}"
+                        with st.spinner(f"Fetching results for Query ID: {query_id}..."):
+                            tab_state["df"] = get_query_results(redash_url, query_id, api_key, param_values)
+                            current_index = st.session_state.tabs.index(tab_state)
+                            tab_state["title"] = f"Query {current_index + 1} ({query_id})"
+                            st.rerun()
+                    else:
+                        st.error("Invalid Query Number. Please enter a valid number.")
 
     # --- Main Content Area for the tab ---
     if not tab_state["df"].empty:
@@ -327,45 +356,69 @@ def render_tab_content(tab_state):
         )
 
         # --- Analysis Section ---
-        st.subheader("💬 Natural Language Analysis")
-        st.info("Ask a question about the data in plain English. The AI will generate and run the code to get the answer.")
-        user_query = st.text_area(
-            "Your question:",
-            height=100,
-            placeholder="e.g., 'What are the top 10 countries by order count?' or 'Plot a bar chart of sales by category'",
-            key=f"analysis_query_{tab_state['id']}"
-        )
+        st.subheader("💬 Chat with your Data")
 
-        if st.button("Analyze", use_container_width=True, key=f"analyze_{tab_state['id']}"):
-            if not groq_api_key:
-                st.error("Please enter your Groq API Key in the sidebar to use this feature.")
-            elif user_query:
-                with st.spinner("AI is analyzing your question..."):
-                    try:
-                        client = Groq(api_key=groq_api_key)
-                        analysis_code = get_llm_analysis_code(client, user_query, tab_state["df"])
-                        
-                        if analysis_code:
-                            st.markdown("---")
-                            st.markdown("##### 🤖 Answer:")
-                            # IMPORTANT: exec() is a security risk. Only use in trusted environments.
-                            exec(analysis_code, {'df': tab_state["df"], 'st': st, 'pd': pd})
-                        else:
-                            st.warning("The AI could not generate code for your request. Please try rephrasing your question.")
-                    except Exception as e:
-                        st.error(f"An error occurred during analysis: {e}")
-            else:
-                st.warning("Please enter a pandas expression to analyze.")    
-    elif query_id and len(tab_state["params"]) > 0 and not param_values:
-        # This case handles when parameters are loaded but not yet filled.
-        st.info("Fill in the required parameters above and click 'Fetch Query Results'.")
+        # To keep the chat input bar at the bottom, the chat history must be in a scrollable container.
+        chat_container = st.container(height=500)
+        with chat_container:
+            key_counter = iter(range(1000)) # Create a counter for unique keys
+            # Display chat history
+            for i, message in enumerate(tab_state["chat_history"]):
+                with st.chat_message(message["role"]):
+                    if message["role"] == "assistant":
+                        # Handle different types of assistant messages
+                        if message["content"]["type"] == "code":
+                            try:
+                                exec(message["content"]["code"], {'df': tab_state["df"], 'st': st, 'pd': pd, 'np': np, 'plt': plt, 'sns': sns, 'px': px, 'key_counter': key_counter})
+                            except KeyError as e:
+                                st.error(f"Oops! I looked everywhere for a column named {e}, but it seems to be playing hide-and-seek. 🙈 Could you try asking about one of the columns I can see in the table above?")
+                            except Exception as e:
+                                st.error("Whoops! It looks like my circuits got a little crossed trying to answer that. 🤖 Sometimes I make a mistake. Could you try rephrasing your question? That usually helps me get back on track!")
+                        elif message["content"]["type"] == "warning":
+                            st.warning(message["content"]["message"])
+                        elif message["content"]["type"] == "error":
+                            st.error(message["content"]["message"])
+                            if st.button("🔄 Retry", key=f"retry_{tab_state['id']}_{i}"):
+                                # Remove the last error message and retry
+                                tab_state["chat_history"].pop() 
+                                handle_chat_submit(tab_state, groq_api_key, is_retry=True)
+                    else: # For user messages, just display the text.
+                        st.markdown(message["content"])
+
+        # User input using st.chat_input for a WhatsApp-like experience
+        if prompt := st.chat_input("Ask a question about the data..."):
+            # Add user message to chat history for context
+            tab_state["chat_history"].append({"role": "user", "content": prompt})
+            handle_chat_submit(tab_state, groq_api_key)
+
     else:
-        st.info("Enter a Query Number and click 'Fetch Query Results' to begin.")
+        st.info("Welcome! Configure your query in the sidebar to get started.")
 
-# --- Render all tabs ---
-tab_titles = [tab["title"] for tab in st.session_state.tabs]
-created_tabs = st.tabs(tab_titles)
+def handle_chat_submit(tab_state, groq_api_key, is_retry=False):
+    """Handles the logic for submitting a prompt to the AI and updating the chat history."""
+    if not groq_api_key:
+        tab_state["chat_history"].append({"role": "assistant", "content": {"type": "error", "message": "Please enter your Groq API Key in the sidebar to use this feature."}})
+    else:
+        with st.spinner("AI is thinking..."):
+            try:
+                client = Groq(api_key=groq_api_key)
+                # If retrying, the user prompt is already in the history.
+                analysis_code = get_llm_analysis_code(client, tab_state["chat_history"], tab_state["df"])
+                if analysis_code:
+                    tab_state["chat_history"].append({"role": "assistant", "content": {"type": "code", "code": analysis_code}})
+                else:
+                    tab_state["chat_history"].append({"role": "assistant", "content": {"type": "warning", "message": "The AI could not generate a response. Please try rephrasing your question."}})
+            except Exception as e:
+                tab_state["chat_history"].append({"role": "assistant", "content": {"type": "error", "message": f"An error occurred during analysis: {e}"}})
+    
+    if not is_retry:
+        # Rerun the script to display the new messages inside the container
+        st.rerun()
+    else:
+        # For retry, we need to rerun to show the new result
+        st.rerun()
 
-for i, tab_ui in enumerate(created_tabs):
-    with tab_ui:
-        render_tab_content(st.session_state.tabs[i])
+# --- Render the active tab's content ---
+if 'tabs' in st.session_state and len(st.session_state.tabs) > st.session_state.active_tab_index:
+    active_tab_state = st.session_state.tabs[st.session_state.active_tab_index]
+    render_tab_content(active_tab_state)
