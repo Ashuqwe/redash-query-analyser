@@ -19,15 +19,15 @@ CONFIG_FILE = "config.json"
 
 # --- Helper Functions ---
 
-def save_config(api_key: str, groq_api_key: str):
-    """Saves the API keys to the config file."""
-    config = {"api_key": api_key, "groq_api_key": groq_api_key}
+def save_config(api_key: str, groq_api_key: str, redash_base_url: str):
+    """Saves the config to the config file."""
+    config = {"api_key": api_key, "groq_api_key": groq_api_key, "redash_base_url": redash_base_url}
     with open(CONFIG_FILE, 'w') as f:
         json.dump(config, f)
 
 def load_config() -> dict:
     """Loads the config from the config file if it exists."""
-    default_config = {"api_key": "", "groq_api_key": ""}
+    default_config = {"api_key": "", "groq_api_key": "", "redash_base_url": "https://common-redash.mmt.live"}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r') as f:
@@ -85,15 +85,13 @@ def get_query_results(redash_url: str, query_id: int, api_key: str, parameters: 
     """
     # The base URL of your Redash instance (e.g., https://redash.yourcompany.com)
     base_url = "/".join(redash_url.split('/')[:3])
-    # Use the dedicated 'refresh' endpoint to execute the query.
+    # Use the dedicated 'refresh' endpoint to execute the query, which is more robust for parameterized queries.
     api_endpoint = f"{base_url}/api/queries/{query_id}/refresh"
 
-    # The /refresh endpoint expects parameters inside a 'parameters' object.
     headers = {'Authorization': f'Key {api_key}', 'Content-Type': 'application/json'}
     payload = {"parameters": parameters} if parameters else {}
     
     try:
-        # Use POST to force a refresh, which works for parameterized queries.
         response = requests.post(api_endpoint, headers=headers, json=payload, timeout=180)
         response.raise_for_status()  # Raises an HTTPError for bad responses
         
@@ -184,8 +182,7 @@ def get_llm_analysis_code(client: Groq, chat_history: list, df: pd.DataFrame) ->
 
     chat_completion = client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
-        model="openai/gpt-oss-20b",
-        # model="llama3-8b-8192",
+        model="meta-llama/llama-guard-4-12b",
     )
     response_content = chat_completion.choices[0].message.content
     # Extract code from the markdown block
@@ -203,11 +200,13 @@ if 'tabs' not in st.session_state:
     st.session_state.tabs = [
         {
             "id": 0,
+            "data_source": "redash",
             "query_id_str": "",
             "params": [],
             "df": pd.DataFrame(),
             "title": "Query 1",
-            "chat_history": []
+            "chat_history": [],
+            "uploaded_filename": ""
         }
     ]
 if 'active_tab_index' not in st.session_state:
@@ -218,15 +217,13 @@ with st.sidebar:
     st.write("Configure queries on the left, see results on the right.")
     st.divider()
 
-    st.header("Connection Details")
-    # As requested, hardcode the base URL and only ask for the query number.
-    REDASH_BASE_URL = "https://common-redash.mmt.live"
-    
-    config = load_config()
-    api_key = st.text_input("Redash User API Key", value=config.get("api_key", ""), type="password")
-    groq_api_key = st.text_input("Groq API Key", value=config.get("groq_api_key", ""), type="password", help="Get a free key from https://console.groq.com/keys")
-    
-    save_keys = st.checkbox("Save API Keys for future use", value=(config.get("api_key") != "" or config.get("groq_api_key") != ""))
+    with st.expander("Connection Details", expanded=True):
+        config = load_config()
+        redash_base_url = st.text_input("Redash Base URL", value=config.get("redash_base_url", "https://common-redash.mmt.live"))
+        api_key = st.text_input("Redash User API Key", value=config.get("api_key", ""), type="password")
+        groq_api_key = st.text_input("Groq API Key", value=config.get("groq_api_key", ""), type="password", help="Get a free key from https://console.groq.com/keys")
+        
+        save_keys = st.checkbox("Save Connection Details for future use", value=(config.get("api_key") != "" or config.get("groq_api_key") != ""))
 
     st.divider()
 
@@ -234,11 +231,13 @@ with st.sidebar:
         new_tab_id = st.session_state.next_tab_id
         st.session_state.tabs.append({
             "id": new_tab_id,
+            "data_source": "redash",
             "query_id_str": "",
             "params": [],
             "df": pd.DataFrame(),
             "title": f"Query {len(st.session_state.tabs) + 1}",
-            "chat_history": []
+            "chat_history": [],
+            "uploaded_filename": ""
         })
         st.session_state.next_tab_id += 1
         # To make the new tab active, we would ideally set it here, but Streamlit's st.tabs
@@ -257,88 +256,129 @@ with st.sidebar:
     st.session_state.active_tab_index = tab_titles.index(selected_title)
 
 def render_tab_content(tab_state):
-    """Renders the UI and logic for a single analysis tab."""
+    """Renders the UI and logic for a single analysis tab."""    
     
     # --- All input controls are now in the sidebar ---
     with st.sidebar:
         with st.expander(f"Controls for {tab_state['title']}", expanded=True):
+            # --- Data Source Selection ---
+            tab_state["data_source"] = st.selectbox(
+                "Data Source",
+                ["redash", "upload"],
+                index=["redash", "upload"].index(tab_state["data_source"]),
+                format_func=lambda x: "Redash Query" if x == "redash" else "Upload File",
+                key=f"data_source_{tab_state['id']}"
+            )
+
             # --- Close Tab Button ---
+
             if len(st.session_state.tabs) > 1:
                 if st.button("❌ Close this Analysis", key=f"close_tab_{tab_state['id']}", help="Close this analysis tab", use_container_width=True):
                     st.session_state.tabs.remove(tab_state)
                     # Re-number the titles and reset active tab index
                     for i, tab in enumerate(st.session_state.tabs):
-                        tab["title"] = f"Query {i + 1}" if "(" not in tab["title"] else f"Query {i + 1} ({tab['title'].split('(')[1]}"
+                        if tab["data_source"] == "redash":
+                            tab["title"] = f"Query {i + 1}" if "(" not in tab["title"] else f"Query {i + 1} ({tab['title'].split('(')[1]}"
+                        else:
+                            tab["title"] = f"Upload {i + 1}" if "(" not in tab["title"] else f"Upload {i + 1} ({tab['title'].split('(')[1]}"
                     st.session_state.active_tab_index = 0
                     st.rerun()
 
-            tab_state["query_id_str"] = st.text_input(
-                "Redash Query Number", 
-                value=tab_state["query_id_str"], 
-                placeholder="e.g., 71328",
-                key=f"query_id_{tab_state['id']}"
-            )
+            if tab_state["data_source"] == "redash":
+                tab_state["query_id_str"] = st.text_input(
+                    "Redash Query Number",
+                    value=tab_state["query_id_str"],
+                    placeholder="e.g., 71328",
+                    key=f"query_id_{tab_state['id']}"
+                )
+            else:
+                uploaded_file = st.file_uploader(
+                    "Upload CSV or Excel file",
+                    type=["csv", "xlsx", "xls"],
+                    key=f"upload_{tab_state['id']}"
+                )
+                if uploaded_file is not None and st.button("Load File", use_container_width=True, key=f"load_file_{tab_state['id']}"):
+                    with st.spinner("Loading file..."):
+                        try:
+                            if uploaded_file.name.endswith('.csv'):
+                                tab_state["df"] = pd.read_csv(uploaded_file)
+                            else:
+                                tab_state["df"] = pd.read_excel(uploaded_file, engine='openpyxl')
+                            tab_state["uploaded_filename"] = uploaded_file.name
+                            tab_state["title"] = f"Upload {st.session_state.tabs.index(tab_state) + 1} ({uploaded_file.name})"
+                            st.success(f"Loaded {len(tab_state['df'])} rows from {uploaded_file.name}.")
+                        except Exception as e:
+                            st.error(f"Failed to load file: {e}")
 
-            query_id = int(tab_state["query_id_str"]) if tab_state["query_id_str"].isdigit() else None
+            if tab_state["data_source"] == "redash":
+                query_id = int(tab_state["query_id_str"]) if tab_state["query_id_str"].isdigit() else None
 
-            if query_id and api_key:
-                if st.button("Load Query Parameters", use_container_width=True, key=f"load_params_{tab_state['id']}"):
-                    with st.spinner("Loading query parameters..."):
-                        tab_state["params"] = get_query_details(REDASH_BASE_URL, query_id, api_key)
-                        if not tab_state["params"]:
-                            st.info("This query has no parameters.")
-            elif tab_state["query_id_str"]:
-                st.warning("Please enter a valid query number.")
-            
-            param_values = {}
-            if tab_state["params"]:
-                st.write("---")
-                st.subheader("Query Parameters")
-                for param in tab_state["params"]:
-                    param_name = param['name']
-                    param_title = param.get('title', param_name)
-                    param_type = param.get('type', 'text')
-                    default_value = param.get('value')
-                    
-                    if param_type == 'date-range':
-                        st.write(f"**{param_title}**")
-                        start_key = f"{param_name}.start"
-                        end_key = f"{param_name}.end"
+                if tab_state["query_id_str"] and not query_id:
+                    st.warning("Please enter a valid query number.")
+                # --- Parameter and Fetch controls ---
+                if query_id and api_key:
+                    if st.button("Load Query Parameters", use_container_width=True, key=f"load_params_{tab_state['id']}"):
+                        with st.spinner("Loading query parameters..."):
+                            tab_state["params"] = get_query_details(redash_base_url, query_id, api_key)
+                            if not tab_state["params"]:
+                                st.info("This query has no parameters.")
+
+                if tab_state["params"]:
+                    st.write("---")
+                    st.subheader("Query Parameters")
+                    for param in tab_state["params"]:
+                        param_name = param['name']
+                        param_title = param.get('title', param_name)
+                        param_type = param.get('type', 'text')
+                        default_value = param.get('value')
                         
-                        param_values[start_key] = st.text_input(
-                            label="Start Date",
-                            value=datetime.today().strftime('%Y-%m-%d'),
-                            key=f"param_{start_key}_{tab_state['id']}"
-                        )
-                        param_values[end_key] = st.text_input(
-                            label="End Date",
-                            value=datetime.today().strftime('%Y-%m-%d'),
-                            key=f"param_{end_key}_{tab_state['id']}"
-                        )
+                        if param_type == 'date-range':
+                            st.write(f"**{param_title}**")
+                            start_key = f"param_{param_name}.start_{tab_state['id']}"
+                            end_key = f"param_{param_name}.end_{tab_state['id']}"
+                            st.text_input(
+                                label="Start Date",
+                                value=datetime.today().strftime('%Y-%m-%d'),
+                                key=start_key
+                            )
+                            st.text_input(
+                                label="End Date",
+                                value=datetime.today().strftime('%Y-%m-%d'),
+                                key=end_key
+                            )
+                        else:
+                            param_key = f"param_{param_name}_{tab_state['id']}"
+                            st.text_input(
+                                label=f"{param_title} (Type: {param_type})",
+                                value=str(default_value) if default_value is not None else "",
+                                key=param_key
+                            )
+
+                if st.button("Fetch Query Results", use_container_width=True, key=f"fetch_results_{tab_state['id']}", type="primary"):
+                    param_values = {}
+                    # Construct param_values from session_state before making the API call
+                    for param in tab_state.get("params", []):
+                        param_name = param['name']
+                        if param['type'] == 'date-range':
+                            # Date-range parameters must be sent as a nested dictionary for the /refresh endpoint.
+                            param_values[param_name] = {
+                                "start": st.session_state.get(f"param_{param_name}.start_{tab_state['id']}", ""),
+                                "end": st.session_state.get(f"param_{param_name}.end_{tab_state['id']}", "")
+                            }
+                        else:
+                            # Simple parameters get the 'p_' prefix.
+                            param_values[f"p_{param_name}"] = st.session_state.get(f"param_{param_name}_{tab_state['id']}", "")
+
+                    if not query_id or not api_key:
+                        st.warning("Please provide a valid Query Number and API Key.")
                     else:
-                        param_values[param_name] = st.text_input(
-                            label=f"{param_title} (Type: {param_type})",
-                            value=str(default_value) if default_value is not None else "",
-                            key=f"param_{param_name}_{tab_state['id']}"
-                        )
-
-            if st.button("Fetch Query Results", use_container_width=True, key=f"fetch_results_{tab_state['id']}"):
-                if not tab_state["query_id_str"] or not api_key:
-                    st.warning("Please provide both the Query Number and API Key.")
-                else:
-                    if query_id:
                         if save_keys:
-                            save_config(api_key, groq_api_key)
-                            st.toast("API Keys saved!", icon="🔑")
-
-                        redash_url = f"{REDASH_BASE_URL}/queries/{query_id}"
+                            save_config(api_key, groq_api_key, redash_base_url)
+                            st.toast("Connection Details saved!", icon="🔑")
+                        redash_url = f"{redash_base_url}/queries/{query_id}"
                         with st.spinner(f"Fetching results for Query ID: {query_id}..."):
                             tab_state["df"] = get_query_results(redash_url, query_id, api_key, param_values)
-                            current_index = st.session_state.tabs.index(tab_state)
-                            tab_state["title"] = f"Query {current_index + 1} ({query_id})"
-                            st.rerun()
-                    else:
-                        st.error("Invalid Query Number. Please enter a valid number.")
+                            tab_state["title"] = f"Query {st.session_state.tabs.index(tab_state) + 1} ({query_id})"
 
     # --- Main Content Area for the tab ---
     if not tab_state["df"].empty:
@@ -346,15 +386,17 @@ def render_tab_content(tab_state):
         st.dataframe(tab_state["df"])
 
         # --- Download Section ---
+        download_filename = f"{tab_state['uploaded_filename'].replace('.csv', '').replace('.xlsx', '').replace('.xls', '')}_results.xlsx" if tab_state["data_source"] == "upload" else f"redash_query_{tab_state['query_id_str']}_results.xlsx"
         st.download_button(
             label="📥 Download as Excel",
             data=to_excel(tab_state["df"]),
-            file_name=f"redash_query_{tab_state['query_id_str']}_results.xlsx",
+            file_name=download_filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
             key=f"download_{tab_state['id']}"
         )
 
+    if not tab_state["df"].empty:
         # --- Analysis Section ---
         st.subheader("💬 Chat with your Data")
 
@@ -392,7 +434,7 @@ def render_tab_content(tab_state):
             handle_chat_submit(tab_state, groq_api_key)
 
     else:
-        st.info("Welcome! Configure your query in the sidebar to get started.")
+        st.info("Welcome! Configure your query or upload a file in the sidebar to get started.")
 
 def handle_chat_submit(tab_state, groq_api_key, is_retry=False):
     """Handles the logic for submitting a prompt to the AI and updating the chat history."""
