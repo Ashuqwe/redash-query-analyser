@@ -182,7 +182,7 @@ def get_llm_analysis_code(client: Groq, chat_history: list, df: pd.DataFrame) ->
 
     chat_completion = client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
-        model="meta-llama/llama-guard-4-12b",
+        model="openai/gpt-oss-20b",
     )
     response_content = chat_completion.choices[0].message.content
     # Extract code from the markdown block
